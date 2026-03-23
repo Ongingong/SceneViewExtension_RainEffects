@@ -1,0 +1,154 @@
+#pragma once
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+// Weather effect parameters
+float CaptureOrthoWide;
+float3 CaptureComponentPosition;
+float WetnessFactor;
+Texture2D RainDepthTexture;
+SamplerState RainDepthTextureSampler;
+
+#pragma region CommonUtils
+    float2 CalcViewportUV(float2 UVViewportMin, float2 UVViewportSizeInverse, float2 UVAndScreenPos)
+    {
+        return (UVAndScreenPos - UVViewportMin) * UVViewportSizeInverse;
+    }
+
+    float3 CalcWorldPositionFromScreen(float4 SvPosition, float DeviceZ)
+    {
+        float4 AdjustedSvPos = SvPosition;
+        AdjustedSvPos.z = DeviceZ;
+        float3 TranslatedWorldPosition = SvPositionToTranslatedWorld(AdjustedSvPos);
+        float3 AbsoluteWorldPosition = TranslatedWorldPosition.xyz - DFHackToFloat(PrimaryView.PreViewTranslation).xyz;
+        return AbsoluteWorldPosition;
+    }
+
+    float RemapRange(float Value, float InMin, float InMax, float OutMin, float OutMax)
+    {
+        return OutMin + (Value - InMin) * (OutMax - OutMin) / (InMax - InMin);
+    }
+
+    float2 Rotate2D(float2 UV, float Angle, float2 Pivot = 0.5f)
+    {
+        float Cos = cos(Angle);
+        float Sin = sin(Angle);
+        float2x2 RotationMatrix = float2x2(Cos, -Sin, Sin, Cos);
+        return mul(RotationMatrix, UV - Pivot) + Pivot;
+    }
+
+    float3 GetGeometricNormal(float3 WorldPosition, float2 UV)
+    {
+        float3 dX = ddx(WorldPosition);
+        float3 dY = ddy(WorldPosition);
+        
+        return normalize(cross(dX, dY));
+    }
+
+    void CalcTriplanarMapping(float3 WorldPosition, float3 VertexNormal, float3 ScaleXYZ, float3 ScaleMultiplier,
+                              out float2 TriplanarMapping, out float XAxis, out float ZAxis)
+    {
+        float3 ScaleFactor = (ScaleXYZ * ScaleMultiplier) * 100.0f;
+        float3 TriplanarUV = WorldPosition * rcp(ScaleFactor);
+        float3 AbsVertexNormal = abs(VertexNormal);
+        AbsVertexNormal *= AbsVertexNormal;
+        
+        float DotResult = max(dot(AbsVertexNormal, 1.f), 0.0001f);
+        float3 RoundedAxis = round(AbsVertexNormal / DotResult);
+        
+        XAxis = RoundedAxis.x;
+        ZAxis = RoundedAxis.z;
+        
+        TriplanarMapping = lerp(lerp(TriplanarUV.rb, TriplanarUV.gb, XAxis), TriplanarUV.rg, ZAxis);    
+    }
+    
+    float3 DeriveNormalZ(float2 NormalRG)
+    {
+        float NormalZ = NormalRG.r * NormalRG.r + NormalRG.g * NormalRG.g;
+        NormalZ = sqrt(saturate(1.0f - NormalZ));
+        return float3(NormalRG, NormalZ);
+    }
+    
+    float3 TriplanarNormalSwizzle(float3 Normal, float XAxis, float ZAxis, float3 VertexNormal)
+    {
+        float3 XAxisNormal = float3(0.f, 0.f, 0.f);
+        XAxisNormal.r = Normal.b * VertexNormal.r;
+        XAxisNormal.g = Normal.r + VertexNormal.g;
+        XAxisNormal.b = Normal.g + VertexNormal.b;
+        
+        float3 YAxisNormal = float3(0.f, 0.f, 0.f);
+        YAxisNormal.r = Normal.r + VertexNormal.r; 
+        YAxisNormal.g = Normal.b * VertexNormal.g;
+        YAxisNormal.b = Normal.g + VertexNormal.b;
+        
+        float3 ZAxisNormal = float3(0.f, 0.f, 0.f);
+        ZAxisNormal.r = Normal.r + VertexNormal.r;
+        ZAxisNormal.g = Normal.g + VertexNormal.g;
+        ZAxisNormal.b = Normal.b * VertexNormal.b;
+        
+        float3 NormalYZ = (YAxisNormal * (1 - XAxis) * (1 - ZAxis)) + (ZAxisNormal * ZAxis);
+        float3 NormalXYZ = (XAxis * (1 - ZAxis) * XAxisNormal) + NormalYZ;
+        
+        float3 N = normalize(VertexNormal);
+        float3 Up = abs(N.z) < 0.999f ? float3(0, 0, 1) : float3(1, 0, 0);
+        float3 T = normalize(cross(Up, N));
+        float3 B = cross(N, T);
+
+        float3x3 WorldToTangent = transpose(float3x3(T, B, N));
+        return mul(WorldToTangent, normalize(NormalXYZ));
+    }
+
+    float3 BlendAngleCorrectedNormal(float3 BaseNormal, float3 AdditionalNormal)
+    {   
+        float3 N1 = float3(BaseNormal.rg, BaseNormal.b + 1.0f);
+        float3 N2 = float3(AdditionalNormal.rg * -1.0f, AdditionalNormal.b);
+        return normalize(N1 * dot(N1, N2) - (BaseNormal.b + 1.0f) * N2);
+    }
+
+    float CalcPixelDistance(float PixelDepth, float MaxDistance, float Hardness)
+    {
+        return saturate(pow(PixelDepth / MaxDistance, Hardness));
+    }
+
+#pragma endregion    
+
+#pragma region WetnessShadowUtils
+
+    /* Calculate the wetness shadow mask based on the height difference between the sampled height map and the actual world position. Epsilon should be smaller than 0.0 */
+    float CalcWetnessShadowMask(float3 WorldNormal, float AmbientOcclusion, float4 ScreenPosition, float2 UV, 
+                                float2 OrthoWide, float3 CaptureComponentPosition, float PixelDepth, float MaxDistance)
+    {
+  
+        float3 AbsoluteWorldPos = CalcWorldPositionFromScreen(ScreenPosition, LookupDeviceZ(UV));
+        
+        WorldNormal = WorldNormal * 2.0f - 1.0f;
+        float NormalDot = dot(WorldNormal, float3(0.0f, 0.0f, 1.0f)) * 0.5f + 0.5f;
+        NormalDot = saturate(step(0.25, NormalDot) + 0.5f);
+        
+        float AmbientOcclusionFactor = RemapRange(AmbientOcclusion, 0.5f, 1.0f, 0.0f, 1.0f);
+
+        [BRANCH]
+        if (PixelDepth > MaxDistance)
+        {
+            return NormalDot * AmbientOcclusionFactor;
+        }
+        
+        float Dither = ValueNoise3D_ALU(AbsoluteWorldPos.xyz, true, 250.0f);
+
+        float2 TexUV;
+        TexUV.x = (AbsoluteWorldPos.x - (CaptureComponentPosition.x - OrthoWide.x * 0.5f)) / OrthoWide.x;
+        TexUV.y = (AbsoluteWorldPos.y - (CaptureComponentPosition.y - OrthoWide.y * 0.5f)) / OrthoWide.y;
+
+        float AbsoluteSampledDepth = CaptureComponentPosition.z - Texture2DSample(RainDepthTexture, RainDepthTextureSampler, TexUV);
+        float WetnessShadowMask = 1 - smoothstep(0.0f, 400.0f, AbsoluteSampledDepth - AbsoluteWorldPos.z);
+        
+        float GradientWeight = pow(WetnessShadowMask * (1.0f - WetnessShadowMask), 2.f);
+        float FinalMask = saturate(WetnessShadowMask + (Dither * GradientWeight));
+        FinalMask = saturate(lerp(FinalMask, NormalDot, CalcPixelDistance(PixelDepth, MaxDistance, 2.0f)));
+        
+        return FinalMask * AmbientOcclusionFactor;
+    }
+
+#pragma endregion
