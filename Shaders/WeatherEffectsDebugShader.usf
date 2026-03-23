@@ -1,0 +1,33 @@
+#include "WeatherEffectsCommon.ush"
+
+Texture2D WorldNormalTexture;
+Texture2D BaseColorTexture;
+
+void DebugWetnessShadowPS(   
+    noperspective float4 UVAndScreenPos : TEXCOORD0,
+    float4 ScreenPosition : SV_POSITION,
+    out float4 OutGBufferC : SV_TARGET0)
+{   
+    float2 UV = UVAndScreenPos.xy;
+	float4 GBufferA = Texture2DSampleLevel(WorldNormalTexture, SceneTexturesStruct_GBufferATextureSampler, UV, 0);
+    float4 GBufferC = Texture2DSampleLevel(BaseColorTexture, SceneTexturesStruct_GBufferCTextureSampler, UV, 0);
+	float4 AdjustedSvPos = float4(ScreenPosition.xy, LookupDeviceZ(UV), ScreenPosition.w);
+    
+	float MaxDistance = 2000.f;
+	float Hardness = 2.0f;
+	float PixelDepth = ConvertFromDeviceZ(LookupDeviceZ(UV));
+	float PixelDistance = CalcPixelDistance(MaxDistance, Hardness, UV);
+	
+    float WetnessShadowMaskFactor = CalcWetnessShadowMask(GBufferA.rgb,
+    													GBufferC.a,
+    													AdjustedSvPos, 
+    													UV, 
+    													CaptureOrthoWide,
+    													CaptureComponentPosition,
+    													PixelDepth,
+    													MaxDistance
+    													);
+	
+	GBufferC.rgb = WetnessShadowMaskFactor;
+    OutGBufferC = GBufferC;
+}
