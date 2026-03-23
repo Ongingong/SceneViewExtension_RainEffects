@@ -1,0 +1,165 @@
+#include "WeatherEffectsCommon.ush"
+
+Texture2D WorldNormalTexture;
+Texture2D MSRITexture;
+Texture2D BaseColorTexture;
+Texture2D WeatherEffectsTexture;
+
+
+// ============================================================
+// Texture / Sampler Defines
+// ============================================================
+
+  // Easy Rain Contents are excluded.
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+void ApplyWetness(inout float3 Albedo, inout float Metallic, inout float Specular, inout float Roughness, float Wetness, float Porosity)
+{
+    Albedo *= lerp(1.0f, 0.25f, Wetness * Porosity * (1.0f - Metallic));
+
+    float BaseSmoothness    = lerp(0.9f, 0.6f, Porosity);
+    float SmoothnessAdjusted = lerp(-0.6f, 0.4f, sqrt(1.0f - Roughness));
+    float FinalSmoothness   = saturate(BaseSmoothness + SmoothnessAdjusted);
+    FinalSmoothness         = clamp(FinalSmoothness, 1.0f - Roughness, 0.9f);
+
+    Roughness = saturate(1.0f - lerp(1.0f - Roughness, FinalSmoothness, Wetness));
+    Specular  = lerp(0.5f, 0.255f, Wetness);
+}
+
+float3 ApplyEasyRainNormal(float3 WorldPosition, float3 WorldNormal, float3 ScaleXYZ, float ScaleMultiplier, float Wetness)
+{
+     // Easy Rain Contents are excluded.
+
+    return DropletsNormal;
+}
+
+// ============================================================
+// Pixel Shaders
+// ============================================================
+
+void WetnessPS(
+    noperspective float4 UVAndScreenPos : TEXCOORD0,
+    float4 ScreenPosition : SV_POSITION,
+    out float4 OutGBufferB : SV_TARGET0)
+{
+    OutGBufferB = 1.0f;
+}
+
+void WetnessStaticPS(
+    noperspective float4 UVAndScreenPos : TEXCOORD0,
+    float4 ScreenPosition : SV_POSITION,
+    out float4 OutGBufferA : SV_TARGET0,
+    out float4 OutGBufferB : SV_TARGET1,
+    out float4 OutGBufferC : SV_TARGET2)
+{
+    float2 UV = UVAndScreenPos.xy;
+
+    float4 GBufferA = Texture2DSampleLevel(WorldNormalTexture, SceneTexturesStruct_GBufferATextureSampler, UV, 0);
+    float4 GBufferB = Texture2DSampleLevel(MSRITexture,        SceneTexturesStruct_GBufferBTextureSampler, UV, 0);
+    float4 GBufferC = Texture2DSampleLevel(BaseColorTexture,   SceneTexturesStruct_GBufferCTextureSampler, UV, 0);
+
+    float3 WorldNormal   = GBufferA.rgb * 2.0f - 1.0f;
+    float  DeviceZ       = LookupDeviceZ(UV);
+    float3 WorldPosition = CalcWorldPositionFromScreen(ScreenPosition, DeviceZ);
+    float4 AdjustedSvPos = float4(ScreenPosition.xy, DeviceZ, ScreenPosition.w);
+    
+    const float PixelDepth = ConvertFromDeviceZ(DeviceZ);
+
+    float WetnessShadowMaskFactor = CalcWetnessShadowMask(
+        GBufferA.rgb, GBufferC.a, AdjustedSvPos, UV,
+        CaptureOrthoWide, CaptureComponentPosition,
+        PixelDepth, 5000.f);
+
+    float Wetness = WetnessShadowMaskFactor * WetnessFactor;
+
+    float4 GBufferD = Texture2DSampleLevel(WeatherEffectsTexture, SceneTexturesStruct_GBufferDTextureSampler, UV, 0);
+    float  Porosity = GBufferD.r;
+        
+    ApplyWetness(GBufferC.rgb, GBufferB.r, GBufferB.g, GBufferB.b, Wetness, Porosity);
+    
+    // Calculate Normal for near distance pixels
+    [BRANCH]
+    if (PixelDepth < 500.f)
+    {
+        float3 DropletsNormal = ApplyEasyRainNormal(WorldPosition, WorldNormal, float3(1.0f, 1.0f, 1.0f), 2.f, Wetness);
+        GBufferA.rgb = BlendAngleCorrectedNormal(GBufferA.rgb * 2.0f - 1.0f, DropletsNormal) * 0.5f + 0.5f;
+    }
+
+    OutGBufferA.rgb = GBufferA.rgb;
+    OutGBufferB     = GBufferB;
+    OutGBufferC     = float4(LinearToSrgb(GBufferC.rgb), GBufferC.a);
+}
+
+// ============================================================
+
+Texture2D   RainAccumulationRTTexture;
+Texture2D   RainAccumulationMaskTexture;
+SamplerState RainAccumulationSampler;
+
+void WetnessTransitionPS(
+    noperspective float4 UVAndScreenPos : TEXCOORD0,
+    float4 ScreenPosition : SV_POSITION,
+    out float4 OutGBufferA : SV_TARGET0,
+    out float4 OutGBufferB : SV_TARGET1,
+    out float4 OutGBufferC : SV_TARGET2)
+{
+    float2 UV      = UVAndScreenPos.xy;
+    float  DeviceZ = LookupDeviceZ(UV);
+
+    float4 GBufferA = Texture2DSampleLevel(WorldNormalTexture, SceneTexturesStruct_GBufferATextureSampler, UV, 0);
+    float4 GBufferB = Texture2DSampleLevel(MSRITexture,        SceneTexturesStruct_GBufferBTextureSampler, UV, 0);
+    float4 GBufferC = Texture2DSampleLevel(BaseColorTexture,   SceneTexturesStruct_GBufferCTextureSampler, UV, 0);
+
+    float3 WorldNormal   = GBufferA.rgb * 2.0f - 1.0f;
+    float3 WorldPosition = CalcWorldPositionFromScreen(ScreenPosition, DeviceZ);
+    float4 AdjustedSvPos = float4(ScreenPosition.xy, DeviceZ, ScreenPosition.w);
+    
+    float3 RainAccumulationScaleFactor = float3(1.0f, 1.0f, 1.0f) * 100.0f;
+    float3 RainAccumulationBombingScaleFactor = float3(1.0f, 1.0f, 1.0f) * 100.0f * 32.f;
+    float2 RainAccumulationUV        = WorldPosition * rcp(RainAccumulationScaleFactor).rg;
+    float2 RainAccumulationBombingUV = WorldPosition * rcp(RainAccumulationBombingScaleFactor).rg;
+    
+    const float MaxDistance = 2000.0f;
+    const float Hardness    = 2.0f;
+    const float PixelDepth = ConvertFromDeviceZ(DeviceZ);
+
+    float WetnessShadowMaskFactor = CalcWetnessShadowMask(
+        GBufferA.rgb, GBufferC.a, AdjustedSvPos, UV,
+        CaptureOrthoWide, CaptureComponentPosition,
+        PixelDepth, 5000.f);
+    
+    float4 GBufferD = Texture2DSampleLevel(WeatherEffectsTexture, SceneTexturesStruct_GBufferDTextureSampler, UV, 0);
+    float  Porosity = GBufferD.r;
+    float Wetness = 0.0f;
+    
+    [BRANCH]
+    if (PixelDepth < MaxDistance)
+    {
+        float RainAccumulationRTSample = Texture2DSample(RainAccumulationRTTexture, RainAccumulationSampler, RainAccumulationUV).r;
+        float4 RainAccumulationMaskSample = Texture2DSample(RainAccumulationMaskTexture, RainAccumulationSampler, RainAccumulationBombingUV);
+        RainAccumulationUV += RainAccumulationMaskSample.rg;
+        float RainAccumulationRTSampleBombed   = Texture2DSample(RainAccumulationRTTexture, RainAccumulationSampler, RainAccumulationUV).r;
+        float RainAccumulationWetnessFactor = lerp(RainAccumulationRTSampleBombed, RainAccumulationRTSample, RainAccumulationMaskSample.b) * dot(WorldNormal, float3(0.0f, 0.0f, 1.0f));
+        Wetness = WetnessShadowMaskFactor * saturate((RainAccumulationWetnessFactor + pow(WetnessFactor, 3.0f)));
+    }
+    else
+    {
+        Wetness = saturate(WetnessShadowMaskFactor * WetnessFactor);
+    }
+    
+    ApplyWetness(GBufferC.rgb, GBufferB.r, GBufferB.g, GBufferB.b, Wetness, Porosity);
+            
+    [BRANCH]
+    if (PixelDepth < 500.f)
+    {   
+        float3 DropletsNormal = ApplyEasyRainNormal(WorldPosition, WorldNormal, float3(1.0f, 1.0f, 1.0f), 2.f, Wetness);
+        GBufferA.rgb = BlendAngleCorrectedNormal(GBufferA.rgb * 2.0f - 1.0f, DropletsNormal) * 0.5f + 0.5f;
+    }
+    
+    OutGBufferA.rgb = GBufferA;
+    OutGBufferB     = GBufferB;
+    OutGBufferC     = float4(LinearToSrgb(GBufferC.rgb), GBufferC.a);
+}
